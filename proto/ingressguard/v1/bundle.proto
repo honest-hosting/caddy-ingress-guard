@@ -1,0 +1,201 @@
+// The ingress-guard bundle format: the module's public contract.
+//
+// A bundle is a small signed manifest plus a zstd payload of named sections. The signature is
+// Ed25519 over the exact manifest bytes (with a domain prefix, see package bundle); nothing is
+// re-serialized for verification. The payload is pinned by its SHA-256 in the manifest.
+//
+// Producers marshal with deterministic options so identical content yields identical bytes
+// (a daily refresh of unchanged content is then recognizable by payload_sha256).
+//
+// Evolution is additive only. format_version changes only for a breaking change.
+syntax = "proto3";
+
+package ingressguard.v1;
+
+option go_package = "github.com/honest-hosting/caddy-ingress-guard/bundle/bundlepb;bundlepb";
+
+// SignedBundle is what travels: on Kafka (inside the operator's envelope, byte for byte) and in
+// the body of the module's PUT /v1/bundle.
+message SignedBundle {
+  bytes manifest = 1;       // Manifest bytes, exactly as signed
+  bytes signature = 2;      // raw Ed25519 signature (64 bytes)
+  string key_id = 3;        // signer key in the keyset, e.g. "signer-1/v2"
+  bytes payload = 4;        // zstd(Payload)
+  SignedKeyset keyset = 5;  // root-signed signer keys; lets signers rotate without restarts
+}
+
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  PAYLOAD_ENCODING_ZSTD = 1;
+}
+
+message Manifest {
+  uint32 format_version = 1;
+  string bundle_id = 2;                       // UUIDv7
+  string target = 3;                          // layer:global | layer:dc:<dc> | site:<uuid> | ingress:<pool>
+  uint64 sequence = 4;                        // monotonic per target
+  int64 issued_at = 5;                        // unix seconds
+  int64 not_before = 6;                       // unix seconds
+  int64 expires_at = 7;                       // unix seconds
+  bytes payload_sha256 = 8;
+  PayloadEncoding payload_encoding = 9;
+  uint64 payload_size = 10;                   // decompressed size; the module also enforces its own cap
+  repeated SectionHeader sections = 11;       // checked before anything is decompressed
+  repeated LayerConstraint layer_constraints = 12;
+  repeated LineageEntry lineage = 13;         // policy revision digests
+  uint64 parent_sequence = 14;
+  string crs_version = 15;
+}
+
+message SectionHeader {
+  string name = 1;
+  string min_module_version = 2;  // semver, e.g. "v0.1.0"
+  bool required = 3;              // unknown or too new: required => reject bundle, else skip section
+}
+
+message LayerConstraint {
+  string target = 1;
+  uint64 min_sequence = 2;
+}
+
+message LineageEntry {
+  string kind = 1;
+  string id = 2;
+  bytes digest = 3;
+}
+
+message Payload {
+  repeated Section sections = 1;
+}
+
+message Section {
+  string name = 1;
+  bytes body = 2;  // the section's own message (below), marshaled
+}
+
+message SignedKeyset {
+  bytes keyset = 1;     // Keyset bytes, exactly as signed
+  bytes signature = 2;  // raw Ed25519 signature by the root key
+  string root_key_id = 3;
+}
+
+message Keyset {
+  uint32 format_version = 1;
+  uint64 keyset_version = 2;
+  int64 issued_at = 3;
+  repeated SignerKey keys = 4;
+}
+
+message SignerKey {
+  string key_id = 1;
+  bytes ed25519_public_key = 2;
+  int64 not_before = 3;  // unix seconds
+  int64 not_after = 4;   // unix seconds
+}
+
+// ---- Section bodies (v1) ----
+
+// "coraza": SecLang text in ordered slots. Composition at the site:
+// global pre, dc pre, site pre, CRS setup, CRS, global post, dc post, site post.
+message CorazaSection {
+  string pre = 1;
+  string crs_setup = 2;
+  string post = 3;
+}
+
+// "crs": the Core Rule Set, as files carried in the bundle or a version embedded in the module.
+message CrsSection {
+  oneof source {
+    CrsFiles files = 1;
+    string embedded_version = 2;
+  }
+}
+
+message CrsFiles {
+  // Path relative to the CRS root, e.g. "rules/REQUEST-901-INITIALIZATION.conf",
+  // "plugins/wordpress-rule-exclusions-before.conf".
+  map<string, bytes> files = 1;
+}
+
+// "trusted_proxies": the site's trusted ingress addresses (layer:dc).
+message TrustedProxiesSection {
+  repeated string cidrs = 1;
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_OFF = 1;
+  MODE_DETECT = 2;
+  MODE_ENFORCE = 3;
+}
+
+// "switches": enforcement mode for the site (site mode) or for the whole pool (multi mode, where
+// detect and off override every profile). Per-site mode at the ingress tier is the site's profile.
+message SwitchesSection {
+  Mode mode = 1;
+}
+
+// "profiles" (multi mode, the ingress tier): a few base WAF profiles, and which site uses which.
+// The module builds one WAF instance per profile, all from the bundle's CRS, in this order:
+//   engine defaults, coraza pre, profile host_rules, coraza crs_setup, profile crs_setup, CRS,
+//   coraza post, then the profile's mode.
+//
+// A request's site identity comes from route metadata (the module's site_identity option), never
+// from the Host header. The module adds it to the request's transaction, and only there, as
+// request header X-Ingress-Guard-Site, after removing any copy the client sent. host_rules key
+// per-site exclusions on that header.
+message ProfilesSection {
+  repeated Profile profiles = 1;
+  string default_profile = 2;     // sites not in `sites`, and routes without a site identity
+  map<string, string> sites = 3;  // site identity -> profile name
+}
+
+message Profile {
+  string name = 1;
+  Mode mode = 2;         // unspecified: enforce; off: this profile's sites are not inspected
+  string crs_setup = 3;  // after the bundle's crs_setup, e.g. this profile's paranoia levels
+  // Per-site exclusions, before CRS, as runtime ctl rules keyed on the site header:
+  //   SecRule REQUEST_HEADERS:X-Ingress-Guard-Site "@pm <uuid> <uuid>" "id:...,phase:1,pass,nolog,ctl:..."
+  // @pm matches substrings; with fixed-length site UUIDs that is an exact match. Coraza costs a
+  // few µs per evaluated rule, and every SecMarker is evaluated in all five phases, so gate the
+  // rules: no identity or no exclusions jumps to a single end marker, and buckets of sites,
+  // skipped with exact skip:N counts, bound the rest. Exclusions must never target these rules'
+  // own IDs. ingress-guard-bundle's hostRules is the reference (S3 runs 2 and 2b).
+  string host_rules = 4;
+}
+
+// ---- Push endpoint responses ----
+
+enum LayerState {
+  LAYER_STATE_UNSPECIFIED = 0;
+  LAYER_STATE_ACTIVE = 1;
+  LAYER_STATE_STALE = 2;          // accepted although expired (ingress-tier last-known-good)
+  LAYER_STATE_PENDING_LAYER = 3;  // waiting for a layer constraint
+}
+
+message LayerStatus {
+  string target = 1;
+  uint64 sequence = 2;
+  bytes payload_sha256 = 3;
+  int64 expires_at = 4;
+  LayerState state = 5;
+  string bundle_id = 6;
+}
+
+// Ack answers PUT /v1/bundle.
+message Ack {
+  bool accepted = 1;
+  string reason = 2;  // rejection reason code; empty when accepted
+  string detail = 3;
+  repeated LayerStatus layers = 4;
+  string module_version = 5;
+  int64 activation_ms = 6;  // verify + build + swap time for this push
+}
+
+// Status answers GET /v1/status.
+message Status {
+  repeated LayerStatus layers = 1;
+  string module_version = 2;
+  bool unprotected = 3;
+  int64 reported_at = 4;
+}
