@@ -7,10 +7,9 @@ go 1.26.0
 require (
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/corazawaf/coraza/v3 v3.8.1
-	github.com/klauspost/compress v1.20.1
+	github.com/honest-hosting/caddy-ingress-guard/bundle v0.0.1
 	github.com/prometheus/client_golang v1.24.1
 	go.uber.org/zap v1.28.0
-	golang.org/x/mod v0.41.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -75,6 +74,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/kaptinlin/go-i18n v0.1.4 // indirect
 	github.com/kaptinlin/jsonschema v0.4.6 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/magefile/mage v1.17.0 // indirect
@@ -153,6 +153,7 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260929172509-b39ff6d641ec // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
+	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
@@ -168,3 +169,8 @@ require (
 	howett.net/plist v1.0.1 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
+
+// The bundle format lives in its own module (bundle/go.mod) so consumers that build or verify
+// bundles (hh-security-service, ingress-agent) don't inherit Caddy's dependency graph. Tag
+// bundle/vX.Y.Z before the root vX.Y.Z; this replace only applies to builds in this repo.
+replace github.com/honest-hosting/caddy-ingress-guard/bundle => ./bundle

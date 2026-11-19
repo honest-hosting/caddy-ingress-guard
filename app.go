@@ -1,9 +1,12 @@
 // Package ingressguard is the ingress-guard Caddy module: a Caddy app that verifies and activates
 // signed policy bundles pushed by a local agent, and HTTP handlers that enforce the active policy.
 //
-// Spike prototype (Phase 02 S2, S3): site and multi modes accept bundles on a loopback push
-// endpoint; static mode builds from Caddy config. Multi mode selects a base profile per site
-// (multi.go). The access-stage controls (Phase 09) are not implemented yet.
+// Site and multi modes accept bundles on a loopback push endpoint; static mode builds from Caddy
+// config. Multi mode selects a base profile per site (multi.go). A handler can also carry its own
+// static rules (static_file / static_directives), so routes on static rules and routes on bundles
+// share one Caddy. Blocks are returned as Caddy errors (handle_errors renders them), and every
+// matched or interrupted transaction is one structured log line (event.go). The access-stage
+// controls (Phase 09) are not implemented yet.
 package ingressguard
 
 import (
@@ -33,6 +36,13 @@ const (
 
 // DefaultSiteIdentity is where multi mode reads a route's site identity by default.
 const DefaultSiteIdentity = "{http.vars.hh.site}"
+
+// DefaultTenantIdentity is where multi mode reads a route's tenant by default. It only labels
+// WAF event log lines; it never selects policy.
+const DefaultTenantIdentity = "{http.vars.hh.tenant}"
+
+// ForceDetect is the force_mode value that makes all bundle-driven enforcement detection-only.
+const ForceDetect = "detect"
 
 // The runtime (active bundles, built WAFs, push listener, metrics) lives in a usage pool so it
 // survives Caddy config reloads: the new app takes the existing runtime before the old one lets
@@ -65,11 +75,27 @@ type App struct {
 	StaticFile string `json:"static_file,omitempty"`
 	// SiteIdentity (multi mode) is the placeholder holding the route's site identity, never
 	// the Host header (FR-04). Default: {http.vars.hh.site}, set by caddy-consul's
-	// consul_route_info.
+	// consul_route_info. A request whose identity is empty is passed through uninspected (and
+	// counted): routes without an identity belong on a handler with static rules.
 	SiteIdentity string `json:"site_identity,omitempty"`
+	// TenantIdentity is a placeholder for the request's tenant, used only to label WAF event
+	// log lines. Multi mode default: {http.vars.hh.tenant}.
+	TenantIdentity string `json:"tenant_identity,omitempty"`
+	// ForceMode "detect" (multi mode only) makes all bundle-driven enforcement detection-only,
+	// whatever the bundle's switches and profiles say: a would-be block is logged as
+	// would_block and the request is served. It is the ingress tier's local break-glass
+	// override. Refused in site mode, and meaningless in static mode. Handlers with their own
+	// static rules are not bundle-driven and keep enforcing.
+	ForceMode string `json:"force_mode,omitempty"`
+	// TxIDHeader names a request header whose value becomes the WAF transaction ID (and the ID
+	// of a block's Caddy error), e.g. X-Request-ID, so WAF events join other logs by request
+	// ID. Set it only where an earlier route replaces any client-sent copy of that header. An
+	// absent or malformed value falls back to Caddy's request UUID ({http.request.uuid}).
+	TxIDHeader string `json:"tx_id_header,omitempty"`
 
 	rt     *runtime
 	logger *zap.Logger
+	siteID string // site mode: the site:<uuid> target's UUID, for event lines
 }
 
 // CaddyModule returns the Caddy module information.
@@ -86,12 +112,22 @@ func (a *App) Provision(ctx caddy.Context) error {
 	if a.Mode == "" {
 		a.Mode = ModeSite
 	}
-	if a.Mode == ModeMulti && a.SiteIdentity == "" {
-		a.SiteIdentity = DefaultSiteIdentity
+	if a.Mode == ModeMulti {
+		if a.SiteIdentity == "" {
+			a.SiteIdentity = DefaultSiteIdentity
+		}
+		if a.TenantIdentity == "" {
+			a.TenantIdentity = DefaultTenantIdentity
+		}
 	}
 	cfg, err := a.runtimeConfig()
 	if err != nil {
 		return err
+	}
+	for _, t := range a.Targets {
+		if strings.HasPrefix(t, bundle.TargetSitePrefix) {
+			a.siteID = strings.TrimPrefix(t, bundle.TargetSitePrefix)
+		}
 	}
 
 	val, _, err := runtimes.LoadOrNew(runtimePoolKey, func() (caddy.Destructor, error) {
@@ -123,6 +159,20 @@ func (a *App) runtimeConfig() (*runtimeConfig, error) {
 		mode:           a.Mode,
 		targets:        map[string]bool{},
 		staleBootstrap: a.StaleBootstrap,
+	}
+	switch a.ForceMode {
+	case "":
+	case ForceDetect:
+		// DR-11 break-glass (c): an ingress-tier option only. In site mode tenant code shares
+		// the host, and static mode has no bundle to override.
+		if a.Mode != ModeMulti {
+			return nil, fmt.Errorf("ingress_guard: force_mode is a multi-mode (ingress tier) option; refused in %s mode", a.Mode)
+		}
+	default:
+		return nil, fmt.Errorf("ingress_guard: unknown force_mode %q (only %q)", a.ForceMode, ForceDetect)
+	}
+	if a.TxIDHeader != "" && !validHeaderName(a.TxIDHeader) {
+		return nil, fmt.Errorf("ingress_guard: tx_id_header %q is not a valid header name", a.TxIDHeader)
 	}
 	switch a.Mode {
 	case ModeStatic:
@@ -194,13 +244,37 @@ func requireLoopback(addr string) error {
 	return nil
 }
 
-// Start starts the push endpoint (once; it survives reloads with the runtime).
+// validHeaderName reports whether s is an HTTP header field name (an RFC 9110 token).
+func validHeaderName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
+// Start starts the push endpoint (once; it survives reloads with the runtime). force_mode is read
+// per request from this config's app, so a reload switches it with no rebuild; the gauge follows
+// the config that is starting.
 func (a *App) Start() error {
+	forced := a.ForceMode == ForceDetect
+	a.rt.setForceDetect(forced)
+	if forced {
+		a.logger.Warn("ingress_guard: force_mode detect: bundle-driven enforcement is detection-only (break-glass)")
+	}
 	if a.Mode == ModeStatic {
 		return nil
 	}
 	return a.rt.ensureServer()
 }
+
+// forceDetect reports whether bundle-driven enforcement is forced to detection-only.
+func (a *App) forceDetect() bool { return a.ForceMode == ForceDetect }
 
 // Stop does nothing: the runtime and its listener outlive a config reload and are destroyed when
 // the last app releases them (Cleanup).

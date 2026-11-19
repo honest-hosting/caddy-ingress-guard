@@ -37,6 +37,16 @@ and swaps it in atomically, without a Caddy reload.
   `static_directives` / `static_file`, no push endpoint).
 - **`stale_bootstrap`:** accepts an expired bundle when nothing is active for its target (the
   ingress agent's last-known-good). Never enable it where tenant code runs.
+- **Multi mode:** `site_identity` / `tenant_identity` (placeholders; a request with no site
+  identity is passed through uninspected and counted in `ingress_guard_no_identity_total`), and
+  `force_mode detect` (break-glass: all bundle-driven enforcement becomes detection-only; refused
+  in site mode).
+- **`tx_id_header <header>`:** the WAF transaction ID (and a block's `{http.error.id}`) comes from
+  this request header, else Caddy's `{http.request.uuid}`.
+- **Handler static rules:** `ingress_guard_inspect { static_file <path> | static_directives <seclang> }`
+  gives one handler its own rules, beside any app mode (e.g. manual routes next to multi mode).
+- **Blocks** are returned as Caddy errors (`handle_errors` renders them); each matched or blocked
+  transaction is one `waf event` line on the `http.handlers.ingress_guard.event` logger.
 
 ## Push endpoint
 

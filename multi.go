@@ -1,28 +1,23 @@
 package ingressguard
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
 	"github.com/corazawaf/coraza/v3"
-	"github.com/corazawaf/coraza/v3/experimental"
-	"github.com/corazawaf/coraza/v3/types"
 
-	"github.com/honest-hosting/caddy-ingress-guard/bundle"
 	"github.com/honest-hosting/caddy-ingress-guard/bundle/bundlepb"
 )
 
 // Multi mode (the ingress tier, S3): one WAF instance per base profile, shared by every site on
 // that profile. Per-site exclusions are host_rules inside the profile, keyed on the site identity
-// the module adds to each transaction (bundle.SiteHeader). A few instances keep memory and
-// rebuild time low while every site keeps its own exceptions.
+// the handler adds to each transaction (bundle.SiteHeader, inspect.go). A few instances keep
+// memory and rebuild time low while every site keeps its own exceptions.
 
 // profileWAF is one built profile. waf is nil when the profile's mode is off.
 type profileWAF struct {
 	name string
-	waf  coraza.WAF // raw wrapped in siteWAF
-	raw  coraza.WAF // what closeWAF releases
+	waf  coraza.WAF
 }
 
 // multiSet is a built profiles section. Immutable once stored in a snapshot.
@@ -32,7 +27,8 @@ type multiSet struct {
 	def      *profileWAF
 }
 
-// forSite returns the site's profile: the default for an unknown site or no identity.
+// forSite returns the site's profile, or the default for a site the bundle doesn't list. The
+// handler never asks for an empty identity: those requests pass through (no_identity).
 func (m *multiSet) forSite(site string) *profileWAF {
 	if p, ok := m.bySite[site]; ok {
 		return p
@@ -45,8 +41,8 @@ func (m *multiSet) close() {
 		return
 	}
 	for _, p := range m.profiles {
-		if p.raw != nil {
-			closeWAF(p.raw)
+		if p.waf != nil {
+			closeWAF(p.waf)
 		}
 	}
 }
@@ -77,11 +73,11 @@ func (c *composed) buildProfiles() (_ *multiSet, err error) {
 			mode = bundlepb.Mode_MODE_DETECT // pool-wide detection-only
 		}
 		if mode != bundlepb.Mode_MODE_OFF {
-			raw, err := c.newWAF(c.directives(p.GetHostRules(), p.GetCrsSetup(), mode))
+			waf, err := c.newWAF(c.directives(p.GetHostRules(), p.GetCrsSetup(), mode))
 			if err != nil {
 				return nil, fmt.Errorf("profile %s: %w", p.GetName(), err)
 			}
-			pw.raw, pw.waf = raw, siteWAF{raw}
+			pw.waf = waf
 		}
 		set.profiles = append(set.profiles, pw)
 		byName[pw.name] = pw
@@ -99,33 +95,3 @@ func (c *composed) buildProfiles() (_ *multiSet, err error) {
 	done = true
 	return set, nil
 }
-
-// siteKey carries the request's site identity from the handler to siteWAF.
-type siteKey struct{}
-
-func withSite(ctx context.Context, site string) context.Context {
-	return context.WithValue(ctx, siteKey{}, site)
-}
-
-// siteWAF adds the request's site identity to each transaction as request header
-// bundle.SiteHeader. coraza's http.WrapHandler creates transactions through
-// NewTransactionWithOptions with the request's context, which is where the handler put it. The
-// header exists only inside the transaction; the handler removes any copy the client sent.
-type siteWAF struct{ coraza.WAF }
-
-func (w siteWAF) NewTransactionWithOptions(o experimental.Options) types.Transaction {
-	var tx types.Transaction
-	if wo, ok := w.WAF.(experimental.WAFWithOptions); ok {
-		tx = wo.NewTransactionWithOptions(o)
-	} else {
-		tx = w.WAF.NewTransaction()
-	}
-	if o.Context != nil {
-		if site, _ := o.Context.Value(siteKey{}).(string); site != "" {
-			tx.AddRequestHeader(bundle.SiteHeader, site)
-		}
-	}
-	return tx
-}
-
-var _ experimental.WAFWithOptions = siteWAF{}

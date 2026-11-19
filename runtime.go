@@ -88,6 +88,14 @@ func newRuntime() *runtime {
 	return rt
 }
 
+func (rt *runtime) setForceDetect(on bool) {
+	if on {
+		rt.metrics.forceDetect.Set(1)
+	} else {
+		rt.metrics.forceDetect.Set(0)
+	}
+}
+
 func (rt *runtime) setLogger(l *zap.Logger)      { rt.logger.Store(l) }
 func (rt *runtime) log() *zap.Logger             { return rt.logger.Load() }
 func (rt *runtime) configure(cfg *runtimeConfig) { rt.cfg.Store(cfg) }
@@ -119,6 +127,20 @@ func (rt *runtime) Destruct() error {
 
 // loadStatic builds the WAF from Caddy config (static mode).
 func (rt *runtime) loadStatic(directives, file string) error {
+	waf, err := buildStatic(directives, file)
+	if err != nil {
+		return err
+	}
+	rt.buildMu.Lock()
+	defer rt.buildMu.Unlock()
+	rt.store(&snapshot{engines: engines{waf: waf}, layers: map[string]*layer{}, builtAt: time.Now()})
+	return nil
+}
+
+// buildStatic builds a WAF from SecLang in Caddy config: static mode, and handlers with their own
+// static rules (DR-03). The directives come first, then the file; Include paths resolve on the
+// local filesystem. The rules are used as given: no engine defaults are added.
+func buildStatic(directives, file string) (coraza.WAF, error) {
 	cfg := coraza.NewWAFConfig()
 	if directives != "" {
 		cfg = cfg.WithDirectives(directives)
@@ -128,12 +150,9 @@ func (rt *runtime) loadStatic(directives, file string) error {
 	}
 	waf, err := coraza.NewWAF(cfg)
 	if err != nil {
-		return fmt.Errorf("ingress_guard: static rules: %w", err)
+		return nil, fmt.Errorf("ingress_guard: static rules: %w", err)
 	}
-	rt.buildMu.Lock()
-	defer rt.buildMu.Unlock()
-	rt.store(&snapshot{engines: engines{waf: waf}, layers: map[string]*layer{}, builtAt: time.Now()})
-	return nil
+	return waf, nil
 }
 
 // closeWAF releases a replaced WAF's share of Coraza's pattern cache.
@@ -369,6 +388,23 @@ func (s *snapshot) layerFor(t string) (*layer, bool) {
 	}
 	l, ok := s.layers[t]
 	return l, ok
+}
+
+// eventLayer is the layer a WAF event names: the most specific active one (the ingress bundle in
+// multi mode, site over DC over global in site mode). Nil when nothing is active.
+func (s *snapshot) eventLayer() *layer {
+	var best *layer
+	for _, l := range s.activeLayers() {
+		if best == nil {
+			best = l
+			continue
+		}
+		rl, rb := bundle.LayerRank(l.target), bundle.LayerRank(best.target)
+		if rl > rb || (rl == rb && l.target > best.target) {
+			best = l
+		}
+	}
+	return best
 }
 
 func (s *snapshot) enginesOrZero() engines {

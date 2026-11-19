@@ -20,13 +20,16 @@ func init() {
 //
 //	ingress_guard {
 //		mode site|multi|static
-//		target <target...>          # also: layers <target...>
-//		root_key <id> <base64>      # repeatable
+//		target <target...>            # also: layers <target...>
+//		root_key <id> <base64>        # repeatable
 //		push_listen 127.0.0.1:2020
-//		stale_bootstrap             # ingress tier only
-//		static_directives <seclang> # static mode
-//		static_file <path>          # static mode
-//		site_identity <placeholder> # multi mode; default {http.vars.hh.site}
+//		stale_bootstrap               # ingress tier only
+//		static_directives <seclang>   # static mode
+//		static_file <path>            # static mode
+//		site_identity <placeholder>   # multi mode; default {http.vars.hh.site}
+//		tenant_identity <placeholder> # event lines only; multi default {http.vars.hh.tenant}
+//		force_mode detect             # multi mode only: break-glass detection-only
+//		tx_id_header <header>         # e.g. X-Request-ID; default: Caddy's request UUID
 //	}
 func parseGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
 	app := &App{RootKeys: map[string]string{}}
@@ -75,19 +78,64 @@ func parseGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
 				return nil, d.ArgErr()
 			}
 			app.SiteIdentity = d.Val()
+		case "tenant_identity":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			app.TenantIdentity = d.Val()
+		case "force_mode":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			app.ForceMode = d.Val()
+		case "tx_id_header":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			app.TxIDHeader = d.Val()
 		default:
 			return nil, d.Errf("unknown ingress_guard option %q", d.Val())
+		}
+		if d.NextArg() {
+			return nil, d.ArgErr()
 		}
 	}
 	return httpcaddyfile.App{Name: "ingress_guard", Value: caddyconfig.JSON(app, nil)}, nil
 }
 
+// parseStage parses a stage directive. The inspect stage takes optional static rules:
+//
+//	ingress_guard_inspect [<matcher>] {
+//		static_file <path>
+//		static_directives <seclang>
+//	}
 func parseStage(stage string) func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	return func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 		h.Next() // directive name
 		if h.NextArg() {
 			return nil, h.ArgErr()
 		}
-		return &Handler{Stage: stage}, nil
+		hd := &Handler{Stage: stage}
+		for h.NextBlock(0) {
+			if stage != StageInspect {
+				return nil, h.Errf("the %s stage takes no options", stage)
+			}
+			opt := h.Val()
+			if !h.NextArg() {
+				return nil, h.ArgErr()
+			}
+			switch opt {
+			case "static_directives":
+				hd.StaticDirectives = h.Val()
+			case "static_file":
+				hd.StaticFile = h.Val()
+			default:
+				return nil, h.Errf("unknown ingress_guard_inspect option %q", opt)
+			}
+			if h.NextArg() {
+				return nil, h.ArgErr()
+			}
+		}
+		return hd, nil
 	}
 }

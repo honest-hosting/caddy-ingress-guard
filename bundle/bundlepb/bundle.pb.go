@@ -1175,7 +1175,7 @@ func (x *SwitchesSection) GetMode() Mode {
 type ProfilesSection struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Profiles       []*Profile             `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
-	DefaultProfile string                 `protobuf:"bytes,2,opt,name=default_profile,json=defaultProfile,proto3" json:"default_profile,omitempty"`                                   // sites not in `sites`, and routes without a site identity
+	DefaultProfile string                 `protobuf:"bytes,2,opt,name=default_profile,json=defaultProfile,proto3" json:"default_profile,omitempty"`                                   // sites not in `sites` (a route without a site identity is not inspected by multi mode; it belongs on static rules)
 	Sites          map[string]string      `protobuf:"bytes,3,rep,name=sites,proto3" json:"sites,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // site identity -> profile name
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache

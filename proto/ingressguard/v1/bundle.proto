@@ -146,7 +146,7 @@ message SwitchesSection {
 // per-site exclusions on that header.
 message ProfilesSection {
   repeated Profile profiles = 1;
-  string default_profile = 2;     // sites not in `sites`, and routes without a site identity
+  string default_profile = 2;     // sites not in `sites` (a route without a site identity is not inspected by multi mode; it belongs on static rules)
   map<string, string> sites = 3;  // site identity -> profile name
 }
 
